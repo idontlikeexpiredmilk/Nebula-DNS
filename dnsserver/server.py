@@ -47,12 +47,15 @@ class DNSServer:
             max_entries=int(self.config.cache.get("max_entries", 10000)),
             ttl_seconds=int(self.config.cache.get("ttl_seconds", 60)),
         )
+        
+        # Initialize rule engine with config values
         self.rule_engine = RuleEngine(
             allowlist=list(self.config.rules.get("allowlist", [])),
             denylist=list(self.config.rules.get("denylist", [])),
             per_client_rules={k: list(v) for k, v in self.config.rules.get("per_client_rules", {}).items()},
             enable_regex=bool(self.config.rules.get("enable_regex", True)),
         )
+        
         self.state = ServerState()
         self.blocklist_manager = BlocklistManager(storage_dir="blocklists")
         self.plugin_manager = PluginManager(package_name="plugins")
@@ -61,17 +64,41 @@ class DNSServer:
         self._running = False
         self._plugins = []
 
-        # Automatically import the adlists.txt file on startup
+        # Log initial rule configuration
+        self.logger.info("Rule engine initialized:")
+        self.logger.info(f"  - Manual denylist entries: {len(self.rule_engine.denylist)}")
+        self.logger.info(f"  - Manual allowlist entries: {len(self.rule_engine.allowlist)}")
+        self.logger.info(f"  - Per-client rules: {len(self.rule_engine.per_client_rules)}")
+        self.logger.info(f"  - Regex enabled: {self.rule_engine.enable_regex}")
+
+        # Load blocklist file BEFORE query processing (extends denylist)
         blocklist_path = self.config.rules.get("blocklist_path", "blocklists/adlists.txt")
-        if Path(blocklist_path).exists():
-            try:
+        if blocklist_path:
+            self._load_blocklist(blocklist_path)
+
+    def _load_blocklist(self, blocklist_path: str) -> None:
+        """Load external blocklist file and add entries to denylist."""
+        try:
+            path = Path(blocklist_path)
+            if path.exists():
                 loaded_domains = self.blocklist_manager.import_from_file(blocklist_path)
-                self.rule_engine.denylist.extend(loaded_domains)
-                self.logger.info("Successfully loaded %d ad domains into the filter engine.", len(loaded_domains))
-            except Exception as e:
-                self.logger.error("Failed to load blocklist file: %s", e)
-        else:
-            self.logger.warning("Blocklist file not found at %s. Skipping import.", blocklist_path)
+                if loaded_domains:
+                    initial_denylist_count = len(self.rule_engine.denylist)
+                    self.rule_engine.denylist.extend(loaded_domains)
+                    
+                    self.logger.info(
+                        f"Successfully loaded {len(loaded_domains)} domains from blocklist: {blocklist_path}"
+                    )
+                    self.logger.info(
+                        f"  - Denylist total: {initial_denylist_count} manual + {len(loaded_domains)} imported = "
+                        f"{len(self.rule_engine.denylist)} total"
+                    )
+                else:
+                    self.logger.warning(f"Blocklist file '{blocklist_path}' is empty")
+            else:
+                self.logger.warning(f"Blocklist file not found at: {blocklist_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to load blocklist from '{blocklist_path}': {e}")
 
     async def start(self) -> None:
         self._running = True
@@ -120,10 +147,17 @@ class DNSServer:
             self._add_log({"client_ip": client_ip, "domain": domain, "cache_hit": True})
             return cached
 
+        # Evaluate domain against rules (checks denylist FIRST before any blocklist files)
         decision = self.rule_engine.evaluate(domain, client_ip)
         if decision.blocked:
             self.state.stats.blocked += 1
-            self._add_log({"client_ip": client_ip, "domain": domain, "blocked": True, "reason": decision.reason})
+            self._add_log({
+                "client_ip": client_ip,
+                "domain": domain,
+                "blocked": True,
+                "reason": decision.reason,
+                "matched_rule": decision.matched_rule
+            })
             return message.build_nxdomain_response()
 
         self.state.stats.allowed += 1
