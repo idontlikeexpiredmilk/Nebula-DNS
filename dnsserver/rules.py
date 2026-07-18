@@ -48,18 +48,29 @@ class RuleEngine:
         return RuleResult(blocked=False)
 
     def _match_rule(self, name: str, pattern: str) -> bool:
+        """Match a domain against a rule pattern (exact, wildcard, regex, or subdomain)."""
         pattern = pattern.strip().lower()
         if not pattern:
             return False
+        
+        # Regex rules start with (
         if self.enable_regex and pattern.startswith("("):
             try:
                 return bool(re.search(pattern, name))
             except re.error:
                 return False
+        
+        # Wildcard rules with *
         if "*" in pattern:
             regex = re.escape(pattern).replace(r"\*", ".*") + "$"
             return bool(re.match(regex, name))
-        return name == pattern
+        
+        # Exact match OR subdomain match
+        # e.g., pattern "google.com" matches "google.com" AND "ads.google.com"
+        if name == pattern or name.endswith("." + pattern):
+            return True
+        
+        return False
 
     def to_dict(self) -> dict[str, Any]:
         return {
