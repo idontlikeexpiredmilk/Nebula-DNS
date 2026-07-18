@@ -37,7 +37,7 @@ rules:
     - "ads.example.com"
     - "tracker.example.com"
     - "*.doubleclick.net"
-    - "(^|\.)googlesyndication\\.com$"
+    - '(^|\.)googlesyndication\.com$'
   
   # Per-client specific rules (by IP address)
   per_client_rules: {}
