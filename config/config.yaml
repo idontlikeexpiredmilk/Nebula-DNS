@@ -22,11 +22,25 @@ dashboard:
 
 logging:
   file: "logs/dnsserver.log"
-  level: "INFO"
+  level: "DEBUG"
 
 rules:
   enable_regex: true
-  allowlist: []
-  denylist: []
+  
+  # Manual allowlist - domains that should NEVER be blocked
+  allowlist:
+    - "example.com"
+  
+  # Manual denylist - domains that should always be blocked
+  # These are checked BEFORE external blocklist files
+  denylist:
+    - "ads.example.com"
+    - "tracker.example.com"
+    - "*.doubleclick.net"
+    - "(^|\.)googlesyndication\\.com$"
+  
+  # Per-client specific rules (by IP address)
   per_client_rules: {}
+  
+  # External blocklist file (one domain per line)
   blocklist_path: "blocklists/adlists.txt"
