@@ -21,7 +21,14 @@ class BlocklistManager:
         return self.deduplicate(entries)
 
     def import_from_file(self, path: str | Path) -> list[str]:
-        return self.import_from_lines(Path(path).read_text(encoding="utf-8").splitlines())
+        """Import domains from file, stripping all whitespace including \\r and \\n."""
+        entries = []
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            line = line.strip()  # Strip \r, \n, spaces, tabs
+            if not line or line.startswith("#"):
+                continue
+            entries.append(line)
+        return self.deduplicate(entries)
 
     def deduplicate(self, entries: Iterable[str]) -> list[str]:
         return list(dict.fromkeys(entries))
