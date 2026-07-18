@@ -33,11 +33,24 @@ rules:
   
   # Manual denylist - domains that should always be blocked
   # These are checked BEFORE external blocklist files
+  # 
+  # Pattern types supported:
+  # 1. Exact: "ads.com" - matches only "ads.com"
+  # 2. Subdomain: "ads.com" - matches "ads.com" AND "sub.ads.com"
+  # 3. Regex (starts with parenthesis): "(^|\.)doubleclick\.net$" - matches domain and all subdomains
+  # 4. Regex: "(^|\.)googlesyndication\.com$" - matches exact pattern
+  #
   denylist:
+    # Exact and subdomain matches (no regex)
     - "ads.example.com"
     - "tracker.example.com"
-    - "*.doubleclick.net"
-    - '(^|\.)googlesyndication\.com$'
+    
+    # Regex patterns - catch the domain and ALL subdomains
+    - "(^|\.)doubleclick\.net$"
+    - "(^|\.)googlesyndication\.com$"
+    - "(^|\.)google-analytics\.com$"
+    - "(^|\.)facebook\.com$"
+    - "(^|\.)api\.facebook\.com$"
   
   # Per-client specific rules (by IP address)
   per_client_rules: {}
