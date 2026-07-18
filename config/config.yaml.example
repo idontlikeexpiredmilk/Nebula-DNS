@@ -1,0 +1,31 @@
+# Nebula DNS Server Configuration
+
+server:
+  host: "0.0.0.0"
+  udp_port: 5353
+  tcp_port: 5354
+  enable_tcp: false
+  timeout_seconds: 2.0
+
+cache:
+  max_entries: 10000
+  ttl_seconds: 60
+
+upstream:
+  servers:
+    - "1.1.1.1"
+    - "1.0.0.1"
+
+dashboard:
+  host: "0.0.0.0"
+  port: 8000
+
+logging:
+  file: "logs/dnsserver.log"
+  level: "INFO"
+
+rules:
+  enable_regex: true
+  allowlist: []
+  denylist: []
+  per_client_rules: {}

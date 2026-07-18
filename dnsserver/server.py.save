@@ -1,0 +1,255 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import socket
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .blocklist_manager import BlocklistManager
+from .cache import DNSCache
+from .config import Config
+from .plugins import PluginManager
+from .protocol import DNSMessage
+from .rules import RuleEngine
+
+
+@dataclass(slots=True)
+class Stats:
+    requests: int = 0
+    blocked: int = 0
+    allowed: int = 0
+    cache_hits: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requests": self.requests,
+            "blocked": self.blocked,
+            "allowed": self.allowed,
+            "cache_hits": self.cache_hits,
+        }
+
+
+@dataclass(slots=True)
+class ServerState:
+    stats: Stats = field(default_factory=Stats)
+    logs: list[dict[str, Any]] = field(default_factory=list)
+    clients: Counter[str] = field(default_factory=Counter)
+    domains: Counter[str] = field(default_factory=Counter)
+    max_logs: int = 1000  # Keep only recent logs to prevent memory leak
+
+
+class DNSServer:
+    """A simple asynchronous DNS server with caching and rule enforcement."""
+
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.logger = logging.getLogger("dnsserver")
+        self.cache = DNSCache(
+            max_entries=int(self.config.cache.get("max_entries", 10000)),
+            ttl_seconds=int(self.config.cache.get("ttl_seconds", 60)),
+        )
+        self.rule_engine = RuleEngine(
+            allowlist=list(self.config.rules.get("allowlist", [])),
+            denylist=list(self.config.rules.get("denylist", [])),
+            per_client_rules={k: list(v) for k, v in self.config.rules.get("per_client_rules", {}).items()},
+            enable_regex=bool(self.config.rules.get("enable_regex", True)),
+\\\        )
+        self.state = ServerState()
+        self.blocklist_manager = BlocklistManager(storage_dir="blocklists")
+        self.plugin_manager = PluginManager(package_name="plugins")
+        self._upstream = list(self.config.upstream.get("servers", ["1.1.1.1"]))
+        self._upstream_index = 0
+        self._running = False
+        self._plugins = []
+
+    async def start(self) -> None:
+        self._running = True
+        host = str(self.config.server.get("host", "0.0.0.0"))
+        udp_port = int(self.config.server.get("udp_port", 5353))
+        self.logger.info("Starting DNS server on %s:%s", host, udp_port)
+        self._plugins = self.plugin_manager.discover()
+        for plugin in self._plugins:
+            plugin.initialize()
+
+        self._udp_transport = await asyncio.get_running_loop().create_datagram_endpoint(
+            lambda: UdpProtocol(self),
+            local_addr=(host, udp_port),
+            family=socket.AF_INET,
+        )
+        if self.config.server.get("enable_tcp", False):
+            tcp_port = int(self.config.server.get("tcp_port", 5354))
+            self._tcp_server = await asyncio.get_running_loop().create_server(
+                lambda: TcpProtocol(self),
+                host,
+                tcp_port,
+            )
+
+    async def stop(self) -> None:
+        self._running = False
+        if hasattr(self, "_udp_transport"):
+            self._udp_transport[0].close()
+        if hasattr(self, "_tcp_server"):
+            self._tcp_server.close()
+            await self._tcp_server.wait_closed()
+
+    async def handle_query(self, payload: bytes, client_ip: str) -> bytes:
+        self.state.stats.requests += 1
+        self.state.clients[client_ip] += 1
+        try:
+            message = DNSMessage(payload)
+            domain = message.question_name()
+            self.state.domains[domain] += 1
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.warning("Malformed query from %s: %s", client_ip, exc)
+            return b""
+
+        cache_key = f"{client_ip}:{domain}"
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            self.state.stats.cache_hits += 1
+            self._add_log({"client_ip": client_ip, "domain": domain, "cache_hit": True})
+            return cached
+
+        decision = self.rule_engine.evaluate(domain, client_ip)
+        if decision.blocked:
+            self.state.stats.blocked += 1
+            self._add_log({"client_ip": client_ip, "domain": domain, "blocked": True, "reason": decision.reason})
+            return message.build_nxdomain_response()
+
+        self.state.stats.allowed += 1
+        response = await self._forward_query(domain)
+        if response:
+            self.cache.set(cache_key, response)
+        self._add_log({"client_ip": client_ip, "domain": domain, "blocked": False, "cache_hit": False})
+        return response
+
+    def _add_log(self, log_entry: dict[str, Any]) -> None:
+        """Add a log entry, maintaining a maximum size to prevent memory leaks."""
+        log_entry["timestamp"] = time.time()
+        self.state.logs.append(log_entry)
+        # Keep only the most recent logs
+        if len(self.state.logs) > self.state.max_logs:
+            self.state.logs = self.state.logs[-self.state.max_logs :]
+
+    async def _forward_query(self, domain: str) -> bytes:
+        """Forward a DNS query to an upstream resolver using proper DNS wire format."""
+        upstream = self._get_upstream_server()
+        timeout = float(self.config.server.get("timeout_seconds", 2.0))
+        try:
+            # Create a simple DNS query packet
+            query_packet = self._build_dns_query(domain)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(upstream, 53),
+                timeout=timeout,
+            )
+            try:
+                # For TCP, prepend 2-byte length field
+                writer.write(len(query_packet).to_bytes(2, "big") + query_packet)
+                await writer.drain()
+                data = await asyncio.wait_for(reader.read(1024), timeout=timeout)
+                return data
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.warning("Upstream lookup failed for %s via %s: %s", domain, upstream, exc)
+            return b""
+
+    def _build_dns_query(self, domain: str) -> bytes:
+        """Build a proper DNS query packet for the given domain."""
+        # DNS header: ID(2), Flags(2), QDCount(2), ANCount(2), NSCount(2), ARCount(2)
+        query = bytearray()
+        query.extend(b"\x00\x00")  # ID=0
+        query.extend(b"\x01\x00")  # Flags: RD=1 (recursion desired)
+        query.extend(b"\x00\x01")  # QDCount=1
+        query.extend(b"\x00\x00")  # ANCount=0
+        query.extend(b"\x00\x00")  # NSCount=0
+        query.extend(b"\x00\x00")  # ARCount=0
+
+        # Question section: encode domain name in DNS format
+        for label in domain.rstrip(".").split("."):
+            query.append(len(label))
+            query.extend(label.encode("ascii", errors="ignore"))
+        query.append(0)  # Root label (end of name)
+
+        # Question type (A record) and class (IN)
+        query.extend(b"\x00\x01")  # QTYPE=A
+        query.extend(b"\x00\x01")  # QCLASS=IN
+
+        return bytes(query)
+
+    def _get_upstream_server(self) -> str:
+        server = self._upstream[self._upstream_index % len(self._upstream)]
+        self._upstream_index += 1
+        return server
+
+    def snapshot(self) -> dict[str, Any]:
+        recent_logs = self.state.logs[-10:]
+        return {
+            "stats": self.state.stats.to_dict(),
+            "cache": self.cache.stats(),
+            "clients": dict(self.state.clients.most_common(10)),
+            "domains": dict(self.state.domains.most_common(10)),
+            "plugins": [plugin.name for plugin in self._plugins],
+            "recent_logs": recent_logs,
+        }
+
+
+class UdpProtocol(asyncio.DatagramProtocol):
+    def __init__(self, server: DNSServer) -> None:
+        self.server = server
+
+    def connection_made(self, transport: asyncio.DatagramTransport) -> None:
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        client_ip = addr[0]
+        asyncio.create_task(self.server.handle_query(data, client_ip))
+
+
+class TcpProtocol(asyncio.Protocol):
+    def __init__(self, server: DNSServer) -> None:
+        self.server = server
+        self._buffer = bytearray()
+        self.transport = None
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport
+
+    def data_received(self, data: bytes) -> None:
+        self._buffer.extend(data)
+        self._process_buffer()
+
+    def _process_buffer(self) -> None:
+        """Process complete DNS messages from the buffer."""
+        while len(self._buffer) >= 2:
+            # Read the 2-byte length field
+            message_length = int.from_bytes(self._buffer[:2], "big")
+            if len(self._buffer) < 2 + message_length:
+                # Not enough data yet
+                break
+
+            # Extract the message
+            message_data = bytes(self._buffer[2 : 2 + message_length])
+            del self._buffer[: 2 + message_length]
+
+            # Process the query
+            client_ip = self.transport.get_extra_info("peername")[0]
+            asyncio.create_task(self._handle_query_and_send(message_data, client_ip))
+
+    async def _handle_query_and_send(self, data: bytes, client_ip: str) -> None:
+        """Handle a query and send the response."""
+        try:
+            response = await self.server.handle_query(data, client_ip)
+            if response and self.transport:
+                # Prepend length field for TCP
+                self.transport.write(len(response).to_bytes(2, "big") + response)
+        except Exception as exc:
+            self.server.logger.error("Error handling TCP query: %s", exc)
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        self._buffer.clear()
