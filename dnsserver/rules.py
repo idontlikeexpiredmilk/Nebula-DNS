@@ -26,7 +26,7 @@ class RuleEngine:
     enable_regex: bool = True
 
     def evaluate(self, name: str, client_ip: str | None = None) -> RuleResult:
-        """
+        r"""
         Evaluate a domain name against the rule engine.
         
         Evaluation order:
@@ -73,7 +73,7 @@ class RuleEngine:
         return RuleResult(blocked=False)
 
     def _match_rule(self, name: str, pattern: str) -> bool:
-        """
+        r"""
         Match a domain against a rule pattern (exact, wildcard, regex, or subdomain).
         
         Supports:
